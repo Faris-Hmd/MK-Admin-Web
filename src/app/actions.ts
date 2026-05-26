@@ -23,7 +23,7 @@ function verifyDb() {
 
 // Action to verify password and log in
 export async function login(password: string) {
-  const expectedPassword = process.env.ADMIN_PASSWORD || 'admin_secret_pass';
+  const expectedPassword = process.env.ADMIN_PASSWORD;
   if (password === expectedPassword) {
     const cookieStore = await cookies();
     cookieStore.set('admin_session', password, {
