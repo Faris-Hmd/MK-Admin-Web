@@ -52,12 +52,35 @@ export async function checkAuthStatus() {
 }
 
 export interface UserDoc {
-  id: string; // The email
+  id: string; // The email or UID
   email: string;
   name: string;
   uid: string;
   approved: boolean;
   createdAt: string;
+  approvedAt?: string;
+  expiresAt?: string;
+  routerCount: number;
+  maxRouters?: number;
+  quota?: string;
+}
+
+// Helper to parse Firestore dates safely
+function parseFirestoreDate(value: any): string | undefined {
+  if (!value) return undefined;
+  if (typeof value.toDate === 'function') {
+    return value.toDate().toISOString();
+  } else if (value.seconds) {
+    return new Date(value.seconds * 1000).toISOString();
+  } else {
+    try {
+      const d = new Date(value);
+      if (!isNaN(d.getTime())) {
+        return d.toISOString();
+      }
+    } catch (e) {}
+    return String(value);
+  }
 }
 
 // Action to fetch all users
@@ -69,21 +92,43 @@ export async function getUsers(): Promise<UserDoc[]> {
   const database = verifyDb();
 
   try {
+    // 1. Fetch routers to aggregate ownership count
+    const routersSnapshot = await database.collection('routers').get();
+    const routerOwnersMap: { [email: string]: number } = {};
+
+    routersSnapshot.forEach((doc) => {
+      const data = doc.data();
+      const owner = (data.owner || '').toLowerCase().trim();
+      const owners = Array.isArray(data.owners) 
+        ? data.owners.map((e: any) => String(e).toLowerCase().trim()) 
+        : [];
+      
+      const uniqueEmails = new Set<string>();
+      if (owner) uniqueEmails.add(owner);
+      owners.forEach((e) => {
+        if (e) uniqueEmails.add(e);
+      });
+
+      uniqueEmails.forEach((email) => {
+        routerOwnersMap[email] = (routerOwnersMap[email] || 0) + 1;
+      });
+    });
+
+    // 2. Fetch users
     const snapshot = await database.collection('users').get();
     const users: UserDoc[] = [];
 
     snapshot.forEach((doc) => {
       const data = doc.data();
-      let dateStr = new Date().toISOString();
-      if (data.createdAt) {
-        if (typeof data.createdAt.toDate === 'function') {
-          dateStr = data.createdAt.toDate().toISOString();
-        } else if (data.createdAt.seconds) {
-          dateStr = new Date(data.createdAt.seconds * 1000).toISOString();
-        } else {
-          dateStr = new Date(data.createdAt).toISOString();
-        }
-      }
+      const userEmail = (data.email || doc.id).toLowerCase().trim();
+      const routerCount = routerOwnersMap[userEmail] || 0;
+
+      const createdAtStr = parseFirestoreDate(data.createdAt) || new Date().toISOString();
+      const approvedAtStr = parseFirestoreDate(data.approvedAt);
+      const expiresAtStr = parseFirestoreDate(data.expiresAt);
+
+      const maxRoutersVal = data.maxRouters !== undefined ? parseInt(data.maxRouters, 10) : undefined;
+      const quotaVal = data.quota !== undefined ? String(data.quota) : undefined;
 
       users.push({
         id: doc.id,
@@ -91,7 +136,12 @@ export async function getUsers(): Promise<UserDoc[]> {
         name: data.name || 'Unnamed User',
         uid: data.uid || '',
         approved: !!data.approved,
-        createdAt: dateStr,
+        createdAt: createdAtStr,
+        approvedAt: approvedAtStr,
+        expiresAt: expiresAtStr,
+        routerCount,
+        maxRouters: maxRoutersVal,
+        quota: quotaVal,
       });
     });
 
@@ -109,18 +159,30 @@ export async function getUsers(): Promise<UserDoc[]> {
 }
 
 // Action to approve user
-export async function approveUser(email: string) {
+export async function approveUser(email: string, expiresAt?: string, maxRouters?: number, quota?: string) {
   if (!(await isAuthenticated())) {
     throw new Error('Unauthorized');
   }
 
   const database = verifyDb();
-
   const docId = email.toLowerCase().trim();
   try {
-    await database.collection('users').doc(docId).update({
+    const updateData: any = {
       approved: true,
-    });
+      approvedAt: new Date(),
+    };
+    if (expiresAt) {
+      updateData.expiresAt = new Date(expiresAt);
+    } else {
+      updateData.expiresAt = null;
+    }
+    if (maxRouters !== undefined) {
+      updateData.maxRouters = maxRouters;
+    }
+    if (quota !== undefined) {
+      updateData.quota = quota;
+    }
+    await database.collection('users').doc(docId).update(updateData);
     return { success: true };
   } catch (error: any) {
     console.error(`Error approving user ${email}:`, error);
@@ -135,11 +197,11 @@ export async function revokeUser(email: string) {
   }
 
   const database = verifyDb();
-
   const docId = email.toLowerCase().trim();
   try {
     await database.collection('users').doc(docId).update({
       approved: false,
+      expiresAt: null,
     });
     return { success: true };
   } catch (error: any) {
@@ -155,7 +217,6 @@ export async function deleteUser(email: string) {
   }
 
   const database = verifyDb();
-
   const docId = email.toLowerCase().trim();
   try {
     await database.collection('users').doc(docId).delete();
@@ -167,13 +228,12 @@ export async function deleteUser(email: string) {
 }
 
 // Action to add a user manually
-export async function addUser(name: string, email: string, approved: boolean) {
+export async function addUser(name: string, email: string, approved: boolean, expiresAt?: string, maxRouters?: number, quota?: string) {
   if (!(await isAuthenticated())) {
     throw new Error('Unauthorized');
   }
 
   const database = verifyDb();
-
   const docId = email.toLowerCase().trim();
   try {
     const userDocRef = database.collection('users').doc(docId);
@@ -183,14 +243,30 @@ export async function addUser(name: string, email: string, approved: boolean) {
       return { error: 'User with this email already exists' };
     }
 
-    await userDocRef.set({
+    const userData: any = {
       uid: 'manual_' + Math.random().toString(36).substring(2, 11),
       email: docId,
       name: name.trim(),
       approved: approved,
-      createdAt: new Date(), // Stored as standard JS Date which Firestore translates to Timestamp
-    });
+      createdAt: new Date(),
+    };
 
+    if (approved) {
+      userData.approvedAt = new Date();
+      userData.expiresAt = expiresAt ? new Date(expiresAt) : null;
+    } else {
+      userData.expiresAt = null;
+    }
+
+    if (maxRouters !== undefined) {
+      userData.maxRouters = maxRouters;
+    }
+
+    if (quota !== undefined) {
+      userData.quota = quota;
+    }
+
+    await userDocRef.set(userData);
     return { success: true };
   } catch (error: any) {
     console.error('Error adding user:', error);
@@ -199,19 +275,44 @@ export async function addUser(name: string, email: string, approved: boolean) {
 }
 
 // Action to update user details
-export async function updateUser(email: string, name: string, approved: boolean) {
+export async function updateUser(email: string, name: string, approved: boolean, expiresAt?: string, maxRouters?: number, quota?: string) {
   if (!(await isAuthenticated())) {
     throw new Error('Unauthorized');
   }
 
   const database = verifyDb();
-
   const docId = email.toLowerCase().trim();
   try {
-    await database.collection('users').doc(docId).update({
+    const docSnap = await database.collection('users').doc(docId).get();
+    if (!docSnap.exists) {
+      throw new Error('User not found');
+    }
+    const currentData = docSnap.data() || {};
+    const wasApproved = !!currentData.approved;
+
+    const updateData: any = {
       name: name.trim(),
       approved: approved,
-    });
+    };
+
+    if (approved) {
+      if (!wasApproved) {
+        updateData.approvedAt = new Date();
+      }
+      updateData.expiresAt = expiresAt ? new Date(expiresAt) : null;
+    } else {
+      updateData.expiresAt = null;
+    }
+
+    if (maxRouters !== undefined) {
+      updateData.maxRouters = maxRouters;
+    }
+
+    if (quota !== undefined) {
+      updateData.quota = quota;
+    }
+
+    await database.collection('users').doc(docId).update(updateData);
     return { success: true };
   } catch (error: any) {
     console.error(`Error updating user ${email}:`, error);
